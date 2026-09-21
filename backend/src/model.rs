@@ -37,8 +37,8 @@ pub struct Snapshot {
     pub status: String,
     pub name: String,
     pub connected: bool,
-    // Physical left/right when established by a current BLE observation.
-    // AAP primary/secondary are remapped by the policy actor.
+    // Physical left/right from BLE while idle, or AAP battery-entry ordering
+    // during a live session. Unknown until that session establishes ordering.
     pub in_ear: [Option<bool>; 2],
     pub battery: Battery,
     pub mode: Option<Mode>,

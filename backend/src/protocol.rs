@@ -18,7 +18,7 @@ pub fn mode_packet(mode: Mode) -> [u8; 11] { [4, 0, 4, 0, 9, 0, 0x0d, mode.value
 pub struct ReceivedKeys { pub irk: Option<[u8; 16]>, pub enc: Option<[u8; 16]> }
 pub enum Packet {
     Ear([Option<bool>; 2]),
-    Batteries(Battery),
+    Batteries { battery: Battery, primary_left: Option<bool> },
     Mode(Option<Mode>),
     Keys(ReceivedKeys),
 }
@@ -38,13 +38,18 @@ pub fn parse(packet: &[u8]) -> Option<Packet> {
             let count = *p.get(2)? as usize;
             let entries = p.get(3..3 + count * 5)?;
             let mut batteries = Battery::default();
+            // AAP's first earbud entry identifies its primary, independently
+            // of the rotating BLE advertiser's primary role.
+            let primary_left = entries.chunks_exact(5).find_map(|e| match e[0] {
+                4 => Some(true), 2 => Some(false), _ => None,
+            });
             for e in entries.chunks_exact(5) {
                 let cell = if e[2] <= 100 && matches!(e[3], 1 | 2) {
                     Cell { percent: Some(e[2]), charging: Some(e[3] == 1) }
                 } else { Cell::default() };
                 match e[0] { 4 => batteries.left = cell, 2 => batteries.right = cell, 8 => batteries.case = cell, _ => {} }
             }
-            Some(Packet::Batteries(batteries))
+            Some(Packet::Batteries { battery: batteries, primary_left })
         }
         0x31 => {
             let count = *p.get(2)? as usize;
@@ -87,7 +92,7 @@ pub fn resolve_rpa(address: [u8; 6], irk: &[u8; 16]) -> bool {
     block[13..] == address[3..]
 }
 
-pub struct Advertisement { pub ears: [Option<bool>; 2], pub battery: Battery, pub primary_left: bool }
+pub struct Advertisement { pub ears: [Option<bool>; 2], pub battery: Battery }
 
 fn battery_byte(value: u8) -> Cell {
     if value == 0xff || value & 0x7f > 100 { Cell::default() }
@@ -115,7 +120,7 @@ pub fn advertisement(data: &[u8], enc: &[u8; 16]) -> Option<Advertisement> {
         right: battery_byte(block[if primary_left { 2 } else { 1 }]),
         case: battery_byte(block[3]),
     };
-    Some(Advertisement { ears, battery, primary_left })
+    Some(Advertisement { ears, battery })
 }
 
 #[cfg(test)]
@@ -144,8 +149,21 @@ mod tests {
     }
     #[test]
     fn disconnected_battery_is_unknown_not_zero() {
-        let Some(Packet::Batteries(b)) = parse(&[4, 0, 4, 0, 4, 0, 1, 4, 0, 0, 4, 0]) else { panic!("battery packet") };
+        let Some(Packet::Batteries { battery: b, .. }) = parse(&[4, 0, 4, 0, 4, 0, 1, 4, 0, 0, 4, 0]) else { panic!("battery packet") };
         assert_eq!(b.left, Cell::default());
+    }
+    #[test]
+    fn aap_primary_follows_first_earbud_not_case_or_component_number() {
+        let Some(Packet::Batteries { primary_left, .. }) = parse(&[
+            4, 0, 4, 0, 4, 0, 3,
+            8, 1, 90, 2, 1, 2, 1, 80, 2, 1, 4, 1, 70, 2, 1,
+        ]) else { panic!("battery packet") };
+        assert_eq!(primary_left, Some(false));
+        let Some(Packet::Batteries { primary_left, .. }) = parse(&[
+            4, 0, 4, 0, 4, 0, 2,
+            4, 1, 70, 2, 1, 2, 1, 80, 2, 1,
+        ]) else { panic!("battery packet") };
+        assert_eq!(primary_left, Some(true));
     }
     #[test]
     fn contradictory_case_bits_never_authorize() {

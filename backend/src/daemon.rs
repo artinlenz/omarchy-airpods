@@ -23,6 +23,7 @@ struct Actor {
     live_ears: bool,
     require_removal: bool,
     primary_left: Option<bool>,
+    aap_ears: [Option<bool>; 2],
     audio: Option<JoinHandle<()>>,
     snapshot: Snapshot,
     snapshots: watch::Sender<Snapshot>,
@@ -40,6 +41,7 @@ impl Actor {
         self.snapshot.status = if self.snapshot.configured { "idle" } else { "setup_required" }.into();
         self.live_ears = false;
         self.primary_left = None;
+        self.aap_ears = [None; 2];
         self.last_ble = None;
         self.ear_deadline = None;
         self.cutoff = Instant::now();
@@ -186,7 +188,6 @@ impl Actor {
                     }
                     return Ok(());
                 };
-                if fresh { self.primary_left = Some(ad.primary_left); }
                 // A live notification-based AAP state is not expired by absent
                 // or stale BLE reports, nor overwritten by older broadcasts.
                 if self.live_ears { return Ok(()); }
@@ -238,14 +239,18 @@ impl Actor {
         }
         Ok(())
     }
+    fn sided_ears(&self) -> [Option<bool>; 2] {
+        match self.primary_left {
+            Some(true) => self.aap_ears,
+            Some(false) => [self.aap_ears[1], self.aap_ears[0]],
+            None => [None; 2],
+        }
+    }
     async fn packet(&mut self, packet: &[u8]) -> Result<()> {
         match protocol::parse(packet) {
             Some(Packet::Ear(ears)) => {
-                let sided = match self.primary_left {
-                    Some(true) => ears,
-                    Some(false) => [ears[1], ears[0]],
-                    None => [None; 2],
-                };
+                self.aap_ears = ears;
+                let sided = self.sided_ears();
                 if !wearing(ears) {
                     if ears == [Some(false); 2] { self.require_removal = false; }
                     self.guard().await?;
@@ -272,7 +277,11 @@ impl Actor {
                     }
                 }
             }
-            Some(Packet::Batteries(battery)) => self.snapshot.battery = battery,
+            Some(Packet::Batteries { battery, primary_left }) => {
+                self.snapshot.battery = battery;
+                self.primary_left = primary_left;
+                if self.live_ears { self.snapshot.in_ear = self.sided_ears(); }
+            }
             Some(Packet::Mode(mode)) => self.snapshot.mode = mode,
             _ => {}
         }
@@ -286,7 +295,7 @@ pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender
     let mut actor = Actor {
         config, session: None, adapter: None, scan: None, connection: None, socket: None,
         generation: 0, cutoff: Instant::now(), last_ble: None, ear_deadline: None, live_ears: false, require_removal: false,
-        primary_left: None, audio: None,
+        primary_left: None, aap_ears: [None; 2], audio: None,
         snapshot: Snapshot::default(), snapshots, tx,
     };
     if let Some(config) = &actor.config { actor.snapshot.name = config.name.clone(); }
