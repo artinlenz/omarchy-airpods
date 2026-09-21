@@ -239,6 +239,7 @@ impl Actor {
             Event::AudioWarning { generation, message } if generation == self.generation && self.live_ears => {
                 self.snapshot.error = Some(message);
             }
+            Event::MediaWarning(message) => self.snapshot.error = Some(message),
             _ => {}
         }
         Ok(())
@@ -301,6 +302,7 @@ impl Actor {
 pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender<Snapshot>, mut shutdown: oneshot::Receiver<()>) -> Result<()> {
     let config = storage::load()?;
     let (tx, mut events) = mpsc::channel(64);
+    let media = tokio::spawn(crate::media::run(snapshots.subscribe(), tx.clone()));
     let mut actor = Actor {
         config, session: None, adapter: None, scan: None, connection: None, socket: None,
         generation: 0, cutoff: Instant::now(), last_ble: None, ear_deadline: None, live_ears: false, require_removal: false,
@@ -383,6 +385,7 @@ pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender
             }
         }
     }
+    media.abort();
     if let Some(task) = actor.scan.take() { task.abort(); }
     actor.guard().await
 }

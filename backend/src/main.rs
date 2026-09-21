@@ -2,6 +2,7 @@
 mod bluetooth;
 mod daemon;
 mod model;
+mod media;
 mod protocol;
 mod storage;
 

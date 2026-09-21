@@ -20,6 +20,8 @@ dependencies = [
  "aes",
  "anyhow",
  "bluer",
+ "dbus",
+ "dbus-tokio",
  "fs2",
  "futures",
  "libc",

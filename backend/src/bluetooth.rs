@@ -13,6 +13,7 @@ pub enum Event {
     Ready { generation: u64, result: Result<Arc<SeqPacket>> },
     Failure(String),
     AudioWarning { generation: u64, message: String },
+    MediaWarning(String),
 }
 
 pub async fn adapter(session: &Session, configured: Option<&Config>) -> Result<Adapter> {

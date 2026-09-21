@@ -270,7 +270,7 @@ Ui.Panel {
               width: parent.width
               textFormat: Text.PlainText
               text: root.busy ? root.service.action
-                : "Connects only with an AirPod in ear. Opening the case does not connect."
+                : "Opening the case does not connect. Removing one bud pauses MPRIS playback; putting it back resumes only playback this service paused."
               color: Color.popups.text
               opacity: 0.7
               font.family: Style.font.family
