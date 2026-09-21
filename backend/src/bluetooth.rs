@@ -158,11 +158,23 @@ fn aac_profile(card: &serde_json::Value) -> Option<&str> {
         let description = profile["description"].as_str().unwrap_or_default();
         (name.contains("a2dp")
             && (name.to_ascii_lowercase().contains("aac") || description.to_ascii_lowercase().contains("aac"))
-            && profile["available"].as_str() != Some("no")).then_some(name.as_str())
+            && profile["available"].as_str() != Some("no")
+            && profile["available"].as_bool() != Some(false)).then_some(name.as_str())
     })
 }
 
 pub async fn prefer_aac(address: &str) -> Result<()> {
+    // AAP can authorize before PipeWire creates the card and its profiles.
+    // Wait only for this target; never silently report a missing card as success.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if select_aac(address).await? { return Ok(()); }
+        if Instant::now() >= deadline { bail!("target audio card has no available AAC profile"); }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn select_aac(address: &str) -> Result<bool> {
     let mut command = tokio::process::Command::new("pactl");
     command.args(["--format=json", "list", "cards"]).kill_on_drop(true);
     let output = timeout(Duration::from_secs(3), command.output()).await.context("audio profile query timed out")??;
@@ -174,16 +186,17 @@ pub async fn prefer_aac(address: &str) -> Result<()> {
         let matches = ["api.bluez5.address", "device.string"].iter().any(|k| properties[*k].as_str().is_some_and(|s| s.eq_ignore_ascii_case(address)));
         if !matches { continue; }
         if let Some(profile) = aac_profile(card) {
-            if card["active_profile"].as_str() == Some(profile) { return Ok(()); }
+            if card["active_profile"].as_str() == Some(profile) { return Ok(true); }
             let name = card["name"].as_str().context("audio card name is missing")?;
             let mut set = tokio::process::Command::new("pactl");
             set.args(["set-card-profile", name, profile]).kill_on_drop(true);
             let out = timeout(Duration::from_secs(3), set.output()).await.context("AAC profile selection timed out")??;
             if !out.status.success() { bail!("AAC profile selection failed"); }
+            return Ok(true);
         }
-        return Ok(());
+        return Ok(false);
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -198,6 +211,8 @@ mod tests {
         }});
         assert_eq!(aac_profile(&card), Some("a2dp-sink"));
         card["profiles"]["a2dp-sink"]["available"] = "no".into();
+        assert_eq!(aac_profile(&card), None);
+        card["profiles"]["a2dp-sink"]["available"] = false.into();
         assert_eq!(aac_profile(&card), None);
     }
 }
