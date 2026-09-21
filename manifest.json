@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "artinlenz.airpods",
+  "name": "AirPods",
+  "version": "1.0.0",
+  "author": "artinlenz",
+  "description": "In-ear-only AirPods connection status, batteries and listening modes",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AirPods",
+    "description": "Compact AirPods status and controls",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

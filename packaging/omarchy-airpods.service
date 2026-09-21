@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=AirPods in-ear connection policy and Omarchy panel backend
+Documentation=https://github.com/artinlenz/omarchy-airpods
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/airpodsd daemon
+ExecStopPost=%h/.local/bin/airpodsd guard
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=35
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

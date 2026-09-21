@@ -1,0 +1,23 @@
+omarchy-airpods backend (airpodsd)
+SPDX-License-Identifier: AGPL-3.0-only
+
+This backend contains protocol and cryptographic routines adapted from
+LibrePods, copyright Kavish Devar and LibrePods contributors.
+Upstream: https://github.com/kavishdevar/librepods
+Sources: linux-rust/src/bluetooth/aacp.rs, linux-rust/src/bluetooth/le.rs,
+linux-rust/src/utils.rs; corroborating proximity layout from
+linux/ble/blemanager.cpp.
+
+Modifications in this project: a headless, device-specific policy daemon;
+bounds-checked protocol parsing; private independent key storage; singleton
+local control socket; explicit enrollment; IRK-resolved advertisement
+identity; conservative in-ear connection authorization; full disconnection
+and BlueZ blocking when not authorized; no GUI, tray, automatic media
+takeover, raw-packet/key logging, feature flags or unrelated firmware writes.
+
+This backend and its modifications are distributed under the GNU Affero
+General Public License version 3 only. See LICENSE in this directory.
+The independently authored frontend and integration files have their own
+license at the project root. No Apple images, symbols, fonts or assets are
+included here. AirPods is a trademark of Apple Inc.; this project is not
+endorsed by or affiliated with Apple Inc.

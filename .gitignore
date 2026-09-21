@@ -1,0 +1,10 @@
+/backend/target/
+*.pkg.tar.*
+/pkg/
+/src/
+*.log
+.env
+config.json
+devices.json
+state.json
+*.sock
