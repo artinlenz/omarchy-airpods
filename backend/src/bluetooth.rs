@@ -64,6 +64,8 @@ pub async fn attach(address: Address) -> Result<Arc<SeqPacket>> {
         .await.context("AAP connect timed out")?.context("AAP control channel unavailable")?;
     let channel = Arc::new(channel);
     send(&channel, protocol::HANDSHAKE).await?;
+    // The device needs time to finish its handshake before subscribing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     send(&channel, protocol::NOTIFICATIONS).await?;
     Ok(channel)
 }

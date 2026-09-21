@@ -21,6 +21,7 @@ struct Actor {
     last_ble: Option<Instant>,
     ear_deadline: Option<Instant>,
     live_ears: bool,
+    require_removal: bool,
     primary_left: Option<bool>,
     audio: Option<JoinHandle<()>>,
     snapshot: Snapshot,
@@ -70,7 +71,7 @@ impl Actor {
         if let Some(config) = self.config.as_ref().filter(|c| c.configured()) {
             self.scan = Some(bluetooth::scanner(adapter, config.clone(), self.tx.clone()).await?);
         }
-        self.snapshot.error = None;
+        self.snapshot.error = self.require_removal.then(|| "Connection interrupted; remove both buds before retrying".into());
         Ok(())
     }
     async fn offline(&mut self, reason: String) {
@@ -136,6 +137,7 @@ impl Actor {
         }
         guard_result?;
         self.reset_state();
+        self.require_removal = false;
         self.scan = Some(bluetooth::scanner(adapter, self.config.clone().unwrap(), self.tx.clone()).await?);
         Ok(())
     }
@@ -154,6 +156,7 @@ impl Actor {
             return Err(e);
         }
         self.config = Some(config);
+        self.require_removal = false;
         self.reset_state();
         self.snapshot.error = None;
         Ok(())
@@ -192,16 +195,20 @@ impl Actor {
                 if !fresh { return Ok(()); }
                 self.last_ble = Some(at);
                 if !wearing(ad.ears) {
+                    if ad.ears == [Some(false); 2] { self.require_removal = false; }
                     let ears = ad.ears;
                     if self.connection.is_some() || self.socket.is_some() { self.guard().await?; }
                     self.snapshot.in_ear = ears;
-                } else if self.connection.is_none() && self.socket.is_none() {
+                } else if !self.require_removal && self.connection.is_none() && self.socket.is_none() {
                     let adapter = self.adapter.clone().context("Bluetooth adapter is unavailable")?;
                     let config = self.config.clone().context("device is not configured")?;
                     // No fallback connects on lid, model, name, RSSI, or merely
                     // advertised disconnected state. Each attempt consumes a
                     // newly received, identity-resolved positive observation.
                     if at.elapsed() > FRESH { return Ok(()); }
+                    // One attempt per wearing transition. A failed AAP check
+                    // must not cause an endless connect/disconnect loop.
+                    self.require_removal = true;
                     adapter.device(config.address.parse()?)?.set_blocked(false).await?;
                     self.snapshot.status = "connecting".into();
                     self.snapshot.error = None;
@@ -240,6 +247,7 @@ impl Actor {
                     None => [None; 2],
                 };
                 if !wearing(ears) {
+                    if ears == [Some(false); 2] { self.require_removal = false; }
                     self.guard().await?;
                     self.snapshot.in_ear = sided;
                 } else {
@@ -277,7 +285,7 @@ pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender
     let (tx, mut events) = mpsc::channel(64);
     let mut actor = Actor {
         config, session: None, adapter: None, scan: None, connection: None, socket: None,
-        generation: 0, cutoff: Instant::now(), last_ble: None, ear_deadline: None, live_ears: false,
+        generation: 0, cutoff: Instant::now(), last_ble: None, ear_deadline: None, live_ears: false, require_removal: false,
         primary_left: None, audio: None,
         snapshot: Snapshot::default(), snapshots, tx,
     };
@@ -325,7 +333,10 @@ pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender
             }
             _ = tick.tick() => {
                 if actor.ear_deadline.is_some_and(|t| Instant::now() >= t) {
-                    if let Err(e) = actor.guard().await { actor.offline(format!("{e:#}")).await; }
+                    match actor.guard().await {
+                        Ok(()) => actor.error("AAP did not confirm in-ear status within five seconds; remove both buds before retrying"),
+                        Err(e) => actor.offline(format!("AAP confirmation timed out; guard failed: {e:#}")).await,
+                    }
                 } else if actor.socket.is_none() && actor.connection.is_none() && actor.last_ble.is_some_and(|t| t.elapsed() > FRESH) {
                     actor.snapshot.in_ear = [None; 2];
                     actor.snapshot.battery = Battery::default();
