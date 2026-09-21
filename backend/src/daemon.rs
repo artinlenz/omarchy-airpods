@@ -24,6 +24,7 @@ struct Actor {
     require_removal: bool,
     primary_left: Option<bool>,
     aap_ears: [Option<bool>; 2],
+    pending_mode: Option<(Mode, Instant)>,
     audio: Option<JoinHandle<()>>,
     snapshot: Snapshot,
     snapshots: watch::Sender<Snapshot>,
@@ -37,6 +38,7 @@ impl Actor {
         self.snapshot.in_ear = [None; 2];
         self.snapshot.battery = Battery::default();
         self.snapshot.mode = None;
+        self.pending_mode = None;
         self.snapshot.configured = self.config.as_ref().is_some_and(Config::configured);
         self.snapshot.status = if self.snapshot.configured { "idle" } else { "setup_required" }.into();
         self.live_ears = false;
@@ -171,6 +173,8 @@ impl Actor {
                 if !self.snapshot.connected || !self.live_ears || !wearing(self.snapshot.in_ear) { bail!("noise control requires a live in-ear connection"); }
                 let channel = self.socket.as_ref().context("AAP control channel is unavailable")?;
                 bluetooth::send(channel, &protocol::mode_packet(mode)).await?;
+                self.pending_mode = (self.snapshot.mode != Some(mode)).then(|| (mode, Instant::now() + Duration::from_secs(5)));
+                self.snapshot.error = None;
                 // Do not optimistically claim the mode; the device notification
                 // is the source of truth, including unsupported mode requests.
                 Ok(())
@@ -282,7 +286,12 @@ impl Actor {
                 self.primary_left = primary_left;
                 if self.live_ears { self.snapshot.in_ear = self.sided_ears(); }
             }
-            Some(Packet::Mode(mode)) => self.snapshot.mode = mode,
+            Some(Packet::Mode(mode)) => {
+                self.snapshot.mode = mode;
+                if self.pending_mode.is_some_and(|(requested, _)| mode == Some(requested)) {
+                    self.pending_mode = None;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -295,7 +304,7 @@ pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender
     let mut actor = Actor {
         config, session: None, adapter: None, scan: None, connection: None, socket: None,
         generation: 0, cutoff: Instant::now(), last_ble: None, ear_deadline: None, live_ears: false, require_removal: false,
-        primary_left: None, aap_ears: [None; 2], audio: None,
+        primary_left: None, aap_ears: [None; 2], pending_mode: None, audio: None,
         snapshot: Snapshot::default(), snapshots, tx,
     };
     if let Some(config) = &actor.config { actor.snapshot.name = config.name.clone(); }
@@ -341,6 +350,10 @@ pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender
                 actor.publish();
             }
             _ = tick.tick() => {
+                if actor.pending_mode.is_some_and(|(_, deadline)| Instant::now() >= deadline) {
+                    actor.pending_mode = None;
+                    actor.snapshot.error = Some("Device did not confirm the requested listening mode; showing its reported mode".into());
+                }
                 if actor.ear_deadline.is_some_and(|t| Instant::now() >= t) {
                     match actor.guard().await {
                         Ok(()) => actor.error("AAP did not confirm in-ear status within five seconds; remove both buds before retrying"),
