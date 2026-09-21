@@ -35,6 +35,19 @@ async fn track(proxy: &Proxy<'_, Arc<SyncConnection>>) -> Result<Option<Track>> 
     Ok((track.id.is_some() || track.url.is_some()).then_some(track))
 }
 
+async fn wait_status(proxy: &Proxy<'_, Arc<SyncConnection>>, expected: &str) -> Result<()> {
+    // MPRIS method replies acknowledge the command, not its completion.
+    // Chromium, for example, publishes Paused after returning from Pause.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status: String = proxy.get(PLAYER, "PlaybackStatus").await?;
+            if status == expected { return Ok::<(), dbus::Error>(()); }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.context("media player did not confirm playback state")??;
+    Ok(())
+}
+
 async fn pause_playing(connection: &Arc<SyncConnection>, snapshots: &watch::Receiver<Snapshot>, warnings: &mpsc::Sender<Event>) -> Result<Vec<PausedPlayer>> {
     let bus = Proxy::new("org.freedesktop.DBus", "/org/freedesktop/DBus", Duration::from_secs(2), connection.clone());
     let (names,): (Vec<String>,) = bus.method_call("org.freedesktop.DBus", "ListNames", ()).await?;
@@ -51,8 +64,7 @@ async fn pause_playing(connection: &Arc<SyncConnection>, snapshots: &watch::Rece
             let identity = track(&proxy).await?;
             if wear(&snapshots.borrow()) != Wear::One { return Ok(None); }
             let (): () = proxy.method_call(PLAYER, "Pause", ()).await?;
-            let status: String = proxy.get(PLAYER, "PlaybackStatus").await?;
-            if status != "Paused" { anyhow::bail!("player did not confirm pause"); }
+            wait_status(&proxy, "Paused").await?;
             let Some(track) = identity else {
                 anyhow::bail!("player has no media identity; paused without automatic resume");
             };
@@ -93,7 +105,7 @@ pub async fn run(mut snapshots: watch::Receiver<Snapshot>, warnings: mpsc::Sende
             // ear identity. A new session must establish its own transition.
             paused.clear();
         } else if previous == Wear::Both && current == Wear::One {
-            match pause_playing(&connection, &snapshots, &warnings).await.context("media pause failed") {
+            match pause_playing(&connection, &snapshots, &warnings).await {
                 Ok(records) => paused = records,
                 Err(_) => warn(&warnings, "Session media controls could not pause playback").await,
             }
@@ -103,8 +115,11 @@ pub async fn run(mut snapshots: watch::Receiver<Snapshot>, warnings: mpsc::Sende
                 if !still_owned(&connection, &record).await.unwrap_or(false) { continue; }
                 let proxy = player(&connection, record.owner);
                 if wear(&snapshots.borrow()) != Wear::Both { break; }
-                let result: Result<(), _> = proxy.method_call(PLAYER, "Play", ()).await;
-                if result.is_err() { warn(&warnings, "A media player could not resume playback").await; }
+                let result: Result<()> = async {
+                    let (): () = proxy.method_call(PLAYER, "Play", ()).await?;
+                    wait_status(&proxy, "Playing").await
+                }.await;
+                if result.is_err() { warn(&warnings, "A media player could not confirm resumed playback").await; }
             }
         } else if !paused.is_empty() {
             // Manual playback or a changed track revokes ownership while the
