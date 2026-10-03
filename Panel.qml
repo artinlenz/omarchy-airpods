@@ -16,10 +16,12 @@ Ui.Panel {
   readonly property var snapshot: service ? service.snapshot : Model.unavailable(false, "AirPods")
   readonly property bool online: !!service && service.online
   readonly property bool busy: !!service && service.busy
+  readonly property bool outdated: !!service && service.outdated
   readonly property string errorText: service ? service.error : "AirPods service is unavailable. Enable this plugin in the built-in Omarchy bar."
   readonly property string percentText: Model.barPercent(snapshot)
   readonly property string statusText: {
     if (!online) return "Backend unavailable"
+    if (outdated) return "Backend outdated: run install.sh"
     if (busy) return service.action
     if (!snapshot.configured) return "One-time setup required"
     if (snapshot.status === "connecting") return "Connecting…"
@@ -211,7 +213,7 @@ Ui.Panel {
               label: "Paired AirPods"
               options: root.deviceOptions
               value: root.selectedAddress
-              enabled: root.online && !root.busy
+              enabled: root.online && !root.outdated && !root.busy
               opacity: enabled ? 1 : 0.45
               onChanged: function(value) { root.selectedAddress = value }
             }
@@ -221,7 +223,7 @@ Ui.Panel {
               foreground: Color.popups.text
               bordered: true
               focusable: true
-              enabled: root.online && !root.busy && root.selectedAddress !== ""
+              enabled: root.online && !root.outdated && !root.busy && root.selectedAddress !== ""
               opacity: enabled ? 1 : 0.45
               onClicked: root.service.setup(root.selectedAddress)
             }
