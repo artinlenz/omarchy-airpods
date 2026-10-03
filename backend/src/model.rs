@@ -63,6 +63,11 @@ pub struct Snapshot {
     pub mode: Option<Mode>,
     pub error: Option<String>,
     pub paired_devices: Vec<PairedDevice>,
+    /// The running backend's package version. The plugin compares it with its
+    /// manifest version, because `omarchy plugin update` never rebuilds the
+    /// daemon. Absent from pre-0.1.0 backends, which read as "".
+    #[serde(default)]
+    pub version: String,
 }
 
 impl Default for Snapshot {
@@ -78,6 +83,7 @@ impl Default for Snapshot {
             mode: None,
             error: None,
             paired_devices: Vec::new(),
+            version: env!("CARGO_PKG_VERSION").into(),
         }
     }
 }

@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use model::{Mode, Snapshot};
 use serde::{Deserialize, Serialize};
-use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -26,6 +26,29 @@ enum WireCommand {
     Setup { address: String },
     Mode { mode: Mode },
     Release,
+}
+
+/// Set by the systemd unit for plugin installs. Empty or unset for
+/// `install.sh --backend-only` and manual runs, which have no plugin folder.
+const PLUGIN_DIR_ENV: &str = "AIRPODSD_PLUGIN_DIR";
+const RESPONSE_LIMIT: usize = 65536;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(40);
+const WATCH_RETRY_MIN: Duration = Duration::from_secs(1);
+const WATCH_RETRY_MAX: Duration = Duration::from_secs(5);
+
+fn socket_path() -> Result<PathBuf> {
+    Ok(storage::runtime_dir()?.join("control.sock"))
+}
+
+fn plugin_dir() -> Result<Option<PathBuf>> {
+    let Some(dir) = std::env::var_os(PLUGIN_DIR_ENV).filter(|dir| !dir.is_empty()) else {
+        return Ok(None);
+    };
+    let dir = PathBuf::from(dir);
+    if !dir.is_absolute() {
+        bail!("{PLUGIN_DIR_ENV} must be an absolute path");
+    }
+    Ok(Some(dir))
 }
 
 fn lock() -> Result<fs::File> {
@@ -116,7 +139,8 @@ async fn serve(
 
 async fn run_daemon() -> Result<()> {
     let _lock = lock()?;
-    let path = storage::runtime_dir()?.join("control.sock");
+    let plugin_dir = plugin_dir()?;
+    let path = socket_path()?;
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -136,7 +160,7 @@ async fn run_daemon() -> Result<()> {
     }
     let (snapshots, receiver) = watch::channel(initial);
     let (stop, shutdown) = oneshot::channel();
-    let mut policy = tokio::spawn(daemon::run(requests, snapshots, shutdown));
+    let mut policy = tokio::spawn(daemon::run(requests, snapshots, shutdown, plugin_dir));
     let slots = Arc::new(Semaphore::new(16));
     let mut clients = tokio::task::JoinSet::new();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -190,11 +214,32 @@ fn offline_snapshot(reason: &str) -> Snapshot {
     snapshot
 }
 
+/// Validates one daemon response line before it is forwarded verbatim.
+fn check_response(line: &str) -> Result<()> {
+    if line.len() > RESPONSE_LIMIT {
+        bail!("daemon response exceeds protocol limit");
+    }
+    let response: serde_json::Value =
+        serde_json::from_str(line).context("invalid daemon response")?;
+    if response["ok"] == false {
+        bail!("{}", response["error"].as_str().unwrap_or("command failed"));
+    }
+    let _: Snapshot = serde_json::from_value(response).context("invalid snapshot schema")?;
+    Ok(())
+}
+
+async fn forward(line: &str) -> Result<()> {
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(line.as_bytes()).await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
 async fn client(command: WireCommand) -> Result<()> {
-    let path = match storage::runtime_dir() {
-        Ok(directory) => directory.join("control.sock"),
+    let path = match socket_path() {
+        Ok(path) => path,
         Err(e) => {
-            if matches!(command, WireCommand::Status | WireCommand::Watch) {
+            if matches!(command, WireCommand::Status) {
                 write_json(
                     &mut tokio::io::stdout(),
                     &offline_snapshot("airpodsd runtime directory is unavailable"),
@@ -208,7 +253,7 @@ async fn client(command: WireCommand) -> Result<()> {
         Ok(stream) => stream,
         Err(e) => {
             match command {
-                WireCommand::Status | WireCommand::Watch => {
+                WireCommand::Status => {
                     write_json(
                         &mut tokio::io::stdout(),
                         &offline_snapshot("airpodsd daemon is unavailable"),
@@ -227,39 +272,81 @@ async fn client(command: WireCommand) -> Result<()> {
             return Err(e).context("airpodsd daemon is unavailable");
         }
     };
-    let watching = matches!(command, WireCommand::Watch);
     let (reader, mut writer) = stream.into_split();
     write_json(&mut writer, &command).await?;
+    let mut line = String::new();
+    let count = timeout(COMMAND_TIMEOUT, BufReader::new(reader).read_line(&mut line))
+        .await
+        .context("daemon command timed out")??;
+    if count == 0 {
+        bail!("daemon control connection closed");
+    }
+    check_response(&line)?;
+    forward(&line).await
+}
+
+/// Forwards one daemon session's snapshots until the daemon closes it.
+/// Returns whether any snapshot arrived. Daemon-side I/O failures end the
+/// session; invalid responses and stdout failures end the watch.
+async fn relay(stream: UnixStream) -> Result<bool> {
+    let (reader, mut writer) = stream.into_split();
+    if write_json(&mut writer, &WireCommand::Watch).await.is_err() {
+        return Ok(false);
+    }
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
+    let mut delivered = false;
     loop {
         line.clear();
-        let count = if watching {
-            reader.read_line(&mut line).await?
-        } else {
-            timeout(Duration::from_secs(40), reader.read_line(&mut line))
-                .await
-                .context("daemon command timed out")??
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => return Ok(delivered),
+            Ok(_) => {}
+        }
+        check_response(&line)?;
+        forward(&line).await?;
+        delivered = true;
+    }
+}
+
+/// The panel's long-lived snapshot stream. A stopped or restarting daemon
+/// yields one offline snapshot per outage and a reconnect with backoff, so
+/// the panel keeps one process instead of respawning it.
+async fn watch() -> Result<()> {
+    let path = match socket_path() {
+        Ok(path) => path,
+        Err(e) => {
+            write_json(
+                &mut tokio::io::stdout(),
+                &offline_snapshot("airpodsd runtime directory is unavailable"),
+            )
+            .await?;
+            return Err(e);
+        }
+    };
+    let mut delay = WATCH_RETRY_MIN;
+    let mut reported_offline = false;
+    loop {
+        let delivered = match UnixStream::connect(&path).await {
+            Ok(stream) => relay(stream).await?,
+            Err(_) => false,
         };
-        if count == 0 {
-            bail!("daemon control connection closed");
+        if delivered {
+            delay = WATCH_RETRY_MIN;
+            reported_offline = false;
         }
-        if line.len() > 65536 {
-            bail!("daemon response exceeds protocol limit");
+        if !reported_offline {
+            write_json(
+                &mut tokio::io::stdout(),
+                &offline_snapshot("airpodsd daemon is unavailable"),
+            )
+            .await?;
+            reported_offline = true;
         }
-        let response: serde_json::Value =
-            serde_json::from_str(&line).context("invalid daemon response")?;
-        if response["ok"] == false {
-            bail!("{}", response["error"].as_str().unwrap_or("command failed"));
-        }
-        let _: Snapshot = serde_json::from_value(response).context("invalid snapshot schema")?;
-        tokio::io::stdout().write_all(line.as_bytes()).await?;
-        tokio::io::stdout().flush().await?;
-        if !watching {
-            break;
+        tokio::time::sleep(delay).await;
+        if !delivered {
+            delay = (delay * 2).min(WATCH_RETRY_MAX);
         }
     }
-    Ok(())
 }
 
 async fn execute() -> Result<()> {
@@ -268,7 +355,7 @@ async fn execute() -> Result<()> {
         ["daemon"] => run_daemon().await,
         ["guard"] => { let _lock = lock()?; daemon::offline_guard(false).await },
         ["status"] => client(WireCommand::Status).await,
-        ["watch"] => client(WireCommand::Watch).await,
+        ["watch"] => watch().await,
         ["release"] => client(WireCommand::Release).await,
         ["setup", address] => {
             let address: bluer::Address = address.parse().context("invalid Bluetooth address")?;

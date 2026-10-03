@@ -5,9 +5,9 @@ use crate::{
     protocol::{self, Packet},
     storage::{self, Config, Keys},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bluer::{l2cap::SeqPacket, Adapter, Session};
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
@@ -24,6 +24,40 @@ pub struct Request {
     pub reply: oneshot::Sender<Result<Snapshot>>,
 }
 const FRESH: Duration = Duration::from_secs(3);
+/// Consecutive maintenance checks that must find the plugin folder missing
+/// before the daemon releases the device. Updates pull in place, so the folder
+/// never disappears during one; this only absorbs a check racing a removal.
+const PLUGIN_GONE_CHECKS: u32 = 2;
+
+/// A failed control command. `offline` is false when the command was refused
+/// or failed without changing device or ownership state, so the BlueZ session
+/// and scanner stay up. Every other failure takes the conservative offline path.
+struct CommandError {
+    error: anyhow::Error,
+    offline: bool,
+}
+
+impl CommandError {
+    fn rejected(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            offline: false,
+        }
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for CommandError {
+    fn from(error: E) -> Self {
+        Self {
+            error: error.into(),
+            offline: true,
+        }
+    }
+}
+
+fn reject(message: &'static str) -> CommandError {
+    CommandError::rejected(anyhow!(message))
+}
 
 struct Actor {
     config: Option<Config>,
@@ -125,14 +159,20 @@ impl Actor {
             Err(e) => format!("{reason}; guard could not be confirmed: {e:#}"),
         });
     }
-    async fn setup(&mut self, address: String) -> Result<()> {
-        let address: bluer::Address = address.parse().context("invalid Bluetooth address")?;
+    async fn setup(&mut self, address: String) -> Result<(), CommandError> {
+        // Validate everything before changing device or ownership state.
+        let address: bluer::Address = address
+            .parse()
+            .context("invalid Bluetooth address")
+            .map_err(CommandError::rejected)?;
         if self
             .config
             .as_ref()
             .is_some_and(|c| c.managed && c.address != address.to_string())
         {
-            bail!("release the managed device before selecting another");
+            return Err(reject(
+                "release the managed device before selecting another",
+            ));
         }
         if self.adapter.is_none() {
             self.initialize().await?;
@@ -142,11 +182,11 @@ impl Actor {
             .clone()
             .context("Bluetooth adapter is unavailable")?;
         if !adapter.is_powered().await? {
-            bail!("Bluetooth adapter is powered off");
+            return Err(reject("Bluetooth adapter is powered off"));
         }
         let device = adapter.device(address)?;
         if !device.is_paired().await? {
-            bail!("setup requires an already paired device");
+            return Err(reject("setup requires an already paired device"));
         }
         let existing = self
             .config
@@ -157,7 +197,9 @@ impl Actor {
             None => device.is_blocked().await?,
         };
         if existing.is_none() && original_blocked {
-            bail!("selected device was already blocked; unblock it explicitly before setup");
+            return Err(reject(
+                "selected device was already blocked; unblock it explicitly before setup",
+            ));
         }
         let mut config = Config {
             schema: 1,
@@ -222,7 +264,7 @@ impl Actor {
             }
             Err(e) => {
                 guard_result?;
-                return Err(e);
+                return Err(e.into());
             }
         }
         guard_result?;
@@ -262,27 +304,28 @@ impl Actor {
         self.snapshot.error = None;
         Ok(())
     }
-    async fn command(&mut self, command: Command) -> Result<()> {
+    async fn command(&mut self, command: Command) -> Result<(), CommandError> {
         match command {
             Command::Setup(address) => self.setup(address).await,
-            Command::Release => self.release().await,
-            Command::Mode(mode) => {
-                if !self.snapshot.connected || !self.live_ears || !wearing(self.snapshot.in_ear) {
-                    bail!("noise control requires a live in-ear connection");
-                }
-                let channel = self
-                    .socket
-                    .as_ref()
-                    .context("AAP control channel is unavailable")?;
-                bluetooth::send(channel, &protocol::mode_packet(mode)).await?;
-                self.pending_mode = (self.snapshot.mode != Some(mode))
-                    .then(|| (mode, Instant::now() + Duration::from_secs(5)));
-                self.snapshot.error = None;
-                // Do not optimistically claim the mode; the device notification
-                // is the source of truth, including unsupported mode requests.
-                Ok(())
-            }
+            Command::Release => Ok(self.release().await?),
+            Command::Mode(mode) => self.set_mode(mode).await.map_err(CommandError::rejected),
         }
+    }
+    async fn set_mode(&mut self, mode: Mode) -> Result<()> {
+        if !self.snapshot.connected || !self.live_ears || !wearing(self.snapshot.in_ear) {
+            bail!("noise control requires a live in-ear connection");
+        }
+        let channel = self
+            .socket
+            .as_ref()
+            .context("AAP control channel is unavailable")?;
+        bluetooth::send(channel, &protocol::mode_packet(mode)).await?;
+        self.pending_mode = (self.snapshot.mode != Some(mode))
+            .then(|| (mode, Instant::now() + Duration::from_secs(5)));
+        self.snapshot.error = None;
+        // Do not optimistically claim the mode; the device notification
+        // is the source of truth, including unsupported mode requests.
+        Ok(())
     }
     async fn event(&mut self, event: Event) -> Result<()> {
         match event {
@@ -364,7 +407,19 @@ impl Actor {
                     return Ok(());
                 }
                 self.connection = None;
-                let socket = result?;
+                let socket = match result {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        // A failed attempt ends this wearing transition only:
+                        // guard the device, keep the BlueZ session and scanner,
+                        // and leave require_removal set so it is not retried.
+                        self.guard().await?;
+                        self.error(format!(
+                            "Connection attempt failed: {e:#}; remove both buds before retrying"
+                        ));
+                        return Ok(());
+                    }
+                };
                 if !wearing(self.snapshot.in_ear) {
                     drop(socket);
                     self.guard().await?;
@@ -472,6 +527,7 @@ pub async fn run(
     mut requests: mpsc::Receiver<Request>,
     snapshots: watch::Sender<Snapshot>,
     mut shutdown: oneshot::Receiver<()>,
+    plugin_dir: Option<PathBuf>,
 ) -> Result<()> {
     let config = storage::load()?;
     let (tx, mut events) = mpsc::channel(64);
@@ -507,6 +563,7 @@ pub async fn run(
     actor.publish();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut maintenance = Instant::now();
+    let mut plugin_missing_checks = 0;
     let mut buffer = [0; 1024];
     loop {
         let socket = actor.socket.clone();
@@ -514,14 +571,14 @@ pub async fn run(
             _ = &mut shutdown => break,
             request = requests.recv() => {
                 let Some(request) = request else { break; };
-                let changes_ownership = !matches!(&request.command, Command::Mode(_));
                 let result = actor.command(request.command).await;
                 if let Err(e) = &result {
-                    if changes_ownership { actor.offline(format!("{e:#}")).await; }
-                    else { actor.snapshot.error = Some(format!("{e:#}")); }
+                    let message = format!("{:#}", e.error);
+                    if e.offline { actor.offline(message).await; }
+                    else { actor.snapshot.error = Some(message); }
                 }
                 actor.publish();
-                let _ = request.reply.send(result.map(|_| actor.snapshot.clone()));
+                let _ = request.reply.send(result.map(|_| actor.snapshot.clone()).map_err(|e| e.error));
             }
             Some(event) = events.recv() => {
                 if let Err(e) = actor.event(event).await {
@@ -570,6 +627,20 @@ pub async fn run(
                             },
                             Ok(false) => actor.offline("Bluetooth adapter is powered off".into()).await,
                             Err(e) => actor.offline(format!("{e:#}")).await,
+                        }
+                    }
+                    // `omarchy plugin remove` runs no hooks. Without its plugin
+                    // the daemon has no UI, so restore the device and stop.
+                    if let Some(dir) = &plugin_dir {
+                        plugin_missing_checks = if dir.is_dir() { 0 } else { plugin_missing_checks + 1 };
+                        if plugin_missing_checks >= PLUGIN_GONE_CHECKS {
+                            match actor.release().await {
+                                Ok(()) => {
+                                    eprintln!("airpodsd: plugin folder {} is gone; device released, stopping", dir.display());
+                                    break;
+                                }
+                                Err(e) => actor.offline(format!("Plugin folder is gone, but release failed: {e:#}")).await,
+                            }
                         }
                     }
                 }
