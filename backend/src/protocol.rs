@@ -59,12 +59,12 @@ pub fn parse(packet: &[u8]) -> Option<Packet> {
             let mut batteries = Battery::default();
             // AAP's first earbud entry identifies its primary, independently
             // of the rotating BLE advertiser's primary role.
-            let primary_left = entries.chunks_exact(5).find_map(|e| match e[0] {
+            let primary_left = entries.as_chunks::<5>().0.iter().find_map(|e| match e[0] {
                 4 => Some(true),
                 2 => Some(false),
                 _ => None,
             });
-            for e in entries.chunks_exact(5) {
+            for e in entries.as_chunks::<5>().0 {
                 let cell = if e[2] <= 100 && matches!(e[3], 1 | 2) {
                     Cell {
                         percent: Some(e[2]),
