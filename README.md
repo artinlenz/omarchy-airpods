@@ -4,6 +4,10 @@ An Omarchy bar widget and background service that let your AirPods connect to th
 
 The widget shows battery levels for each bud and the case, and which buds are in your ears. It also switches listening modes and pauses playback when you take one bud out.
 
+![The AirPods widget in the Omarchy bar with its panel open](preview.jpg)
+
+<img src="docs/panel.png" alt="Panel: battery for each bud and the case, in-ear state, listening mode buttons" width="400">
+
 > [!IMPORTANT]
 > This plugin **blocks your AirPods in BlueZ**. Any connection not started by in-ear detection is cut, including one you start from Omarchy's Bluetooth panel or `bluetoothctl`. To connect them normally again, release them (see [Removal](#removal)).
 
