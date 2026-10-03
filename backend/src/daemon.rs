@@ -1,13 +1,63 @@
-// SPDX-License-Identifier: AGPL-3.0-only
-use anyhow::{bail, Context, Result};
-use bluer::{Adapter, Session, l2cap::SeqPacket};
-use std::{sync::Arc, time::Duration};
-use tokio::{sync::{mpsc, oneshot, watch}, task::JoinHandle, time::{timeout, Instant}};
-use crate::{bluetooth::{self, Event}, model::{wearing, Battery, Mode, Snapshot}, protocol::{self, Packet}, storage::{self, Config, Keys}};
+// SPDX-License-Identifier: GPL-3.0-or-later
+use crate::{
+    bluetooth::{self, Event},
+    model::{wearing, Battery, Mode, Snapshot},
+    protocol::{self, Packet},
+    storage::{self, Config, Keys},
+};
+use anyhow::{anyhow, bail, Context, Result};
+use bluer::{l2cap::SeqPacket, Adapter, Session};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
+    time::{timeout, Instant},
+};
 
-pub enum Command { Setup(String), Mode(Mode), Release }
-pub struct Request { pub command: Command, pub reply: oneshot::Sender<Result<Snapshot>> }
+pub enum Command {
+    Setup(String),
+    Mode(Mode),
+    Release,
+}
+pub struct Request {
+    pub command: Command,
+    pub reply: oneshot::Sender<Result<Snapshot>>,
+}
 const FRESH: Duration = Duration::from_secs(3);
+/// Consecutive maintenance checks that must find the plugin folder missing
+/// before the daemon releases the device. Updates pull in place, so the folder
+/// never disappears during one; this only absorbs a check racing a removal.
+const PLUGIN_GONE_CHECKS: u32 = 2;
+
+/// A failed control command. `offline` is false when the command was refused
+/// or failed without changing device or ownership state, so the BlueZ session
+/// and scanner stay up. Every other failure takes the conservative offline path.
+struct CommandError {
+    error: anyhow::Error,
+    offline: bool,
+}
+
+impl CommandError {
+    fn rejected(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            offline: false,
+        }
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for CommandError {
+    fn from(error: E) -> Self {
+        Self {
+            error: error.into(),
+            offline: true,
+        }
+    }
+}
+
+fn reject(message: &'static str) -> CommandError {
+    CommandError::rejected(anyhow!(message))
+}
 
 struct Actor {
     config: Option<Config>,
@@ -32,7 +82,9 @@ struct Actor {
 }
 
 impl Actor {
-    fn publish(&self) { self.snapshots.send_replace(self.snapshot.clone()); }
+    fn publish(&self) {
+        self.snapshots.send_replace(self.snapshot.clone());
+    }
     fn reset_state(&mut self) {
         self.snapshot.connected = false;
         self.snapshot.in_ear = [None; 2];
@@ -40,7 +92,12 @@ impl Actor {
         self.snapshot.mode = None;
         self.pending_mode = None;
         self.snapshot.configured = self.config.as_ref().is_some_and(Config::configured);
-        self.snapshot.status = if self.snapshot.configured { "idle" } else { "setup_required" }.into();
+        self.snapshot.status = if self.snapshot.configured {
+            "idle"
+        } else {
+            "setup_required"
+        }
+        .into();
         self.live_ears = false;
         self.primary_left = None;
         self.aap_ears = [None; 2];
@@ -50,12 +107,18 @@ impl Actor {
         self.generation = self.generation.wrapping_add(1);
     }
     async fn guard(&mut self) -> Result<()> {
-        if let Some(task) = self.connection.take() { task.abort(); }
-        if let Some(task) = self.audio.take() { task.abort(); }
+        if let Some(task) = self.connection.take() {
+            task.abort();
+        }
+        if let Some(task) = self.audio.take() {
+            task.abort();
+        }
         self.socket = None;
         self.reset_state();
         if let (Some(adapter), Some(config)) = (&self.adapter, &self.config) {
-            if config.managed { bluetooth::block(adapter, config).await?; }
+            if config.managed {
+                bluetooth::block(adapter, config).await?;
+            }
         }
         Ok(())
     }
@@ -64,48 +127,96 @@ impl Actor {
         self.snapshot.error = Some(error.to_string());
     }
     async fn initialize(&mut self) -> Result<()> {
-        let session = Session::new().await.context("BlueZ system service is unavailable")?;
+        let session = Session::new()
+            .await
+            .context("BlueZ system service is unavailable")?;
         let adapter = bluetooth::adapter(&session, self.config.as_ref()).await?;
         self.adapter = Some(adapter.clone());
         self.session = Some(session);
         // Install protection even while the radio is off, before discovery.
         self.guard().await?;
         self.snapshot.paired_devices = bluetooth::paired(&adapter).await?;
-        if !adapter.is_powered().await? { bail!("Bluetooth adapter is powered off"); }
+        if !adapter.is_powered().await? {
+            bail!("Bluetooth adapter is powered off");
+        }
         if let Some(config) = self.config.as_ref().filter(|c| c.configured()) {
             self.scan = Some(bluetooth::scanner(adapter, config.clone(), self.tx.clone()).await?);
         }
-        self.snapshot.error = self.require_removal.then(|| "Connection interrupted; remove both buds before retrying".into());
+        self.snapshot.error = self
+            .require_removal
+            .then(|| "Connection interrupted; remove both buds before retrying".into());
         Ok(())
     }
     async fn offline(&mut self, reason: String) {
-        if let Some(task) = self.scan.take() { task.abort(); }
+        if let Some(task) = self.scan.take() {
+            task.abort();
+        }
         let guarded = self.guard().await;
         self.adapter = None;
         self.session = None;
-        self.error(match guarded { Ok(()) => reason, Err(e) => format!("{reason}; guard could not be confirmed: {e:#}") });
+        self.error(match guarded {
+            Ok(()) => reason,
+            Err(e) => format!("{reason}; guard could not be confirmed: {e:#}"),
+        });
     }
-    async fn setup(&mut self, address: String) -> Result<()> {
-        let address: bluer::Address = address.parse().context("invalid Bluetooth address")?;
-        if self.config.as_ref().is_some_and(|c| c.managed && c.address != address.to_string()) { bail!("release the managed device before selecting another"); }
-        if self.adapter.is_none() { self.initialize().await?; }
-        let adapter = self.adapter.clone().context("Bluetooth adapter is unavailable")?;
-        if !adapter.is_powered().await? { bail!("Bluetooth adapter is powered off"); }
+    async fn setup(&mut self, address: String) -> Result<(), CommandError> {
+        // Validate everything before changing device or ownership state.
+        let address: bluer::Address = address
+            .parse()
+            .context("invalid Bluetooth address")
+            .map_err(CommandError::rejected)?;
+        if self
+            .config
+            .as_ref()
+            .is_some_and(|c| c.managed && c.address != address.to_string())
+        {
+            return Err(reject(
+                "release the managed device before selecting another",
+            ));
+        }
+        if self.adapter.is_none() {
+            self.initialize().await?;
+        }
+        let adapter = self
+            .adapter
+            .clone()
+            .context("Bluetooth adapter is unavailable")?;
+        if !adapter.is_powered().await? {
+            return Err(reject("Bluetooth adapter is powered off"));
+        }
         let device = adapter.device(address)?;
-        if !device.is_paired().await? { bail!("setup requires an already paired device"); }
-        let existing = self.config.as_ref().filter(|c| c.managed && c.address == address.to_string());
-        let original_blocked = match existing { Some(c) => c.original_blocked, None => device.is_blocked().await? };
-        if existing.is_none() && original_blocked { bail!("selected device was already blocked; unblock it explicitly before setup"); }
+        if !device.is_paired().await? {
+            return Err(reject("setup requires an already paired device"));
+        }
+        let existing = self
+            .config
+            .as_ref()
+            .filter(|c| c.managed && c.address == address.to_string());
+        let original_blocked = match existing {
+            Some(c) => c.original_blocked,
+            None => device.is_blocked().await?,
+        };
+        if existing.is_none() && original_blocked {
+            return Err(reject(
+                "selected device was already blocked; unblock it explicitly before setup",
+            ));
+        }
         let mut config = Config {
-            schema: 1, adapter: adapter.address().await?.to_string(), address: address.to_string(),
-            name: device.name().await?.unwrap_or_else(|| "AirPods".into()), original_blocked, managed: true,
+            schema: 1,
+            adapter: adapter.address().await?.to_string(),
+            address: address.to_string(),
+            name: device.name().await?.unwrap_or_else(|| "AirPods".into()),
+            original_blocked,
+            managed: true,
             keys: existing.and_then(|c| c.keys.clone()),
         };
         // Persist ownership BEFORE any temporary unblock. A crash during setup
         // is recoverable with guard/release, even before keys have arrived.
         storage::save(&config)?;
         self.config = Some(config.clone());
-        if let Some(task) = self.scan.take() { task.abort(); }
+        if let Some(task) = self.scan.take() {
+            task.abort();
+        }
         self.guard().await?;
         self.snapshot.status = "connecting".into();
         self.snapshot.name = config.name.clone();
@@ -113,21 +224,35 @@ impl Actor {
         self.publish();
         let result = timeout(Duration::from_secs(25), async {
             device.set_blocked(false).await?;
-            device.connect().await.context("setup Bluetooth connection failed")?;
+            device
+                .connect()
+                .await
+                .context("setup Bluetooth connection failed")?;
             let channel = bluetooth::attach(address).await?;
             bluetooth::send(&channel, protocol::KEYS_REQUEST).await?;
             let mut received = protocol::ReceivedKeys::default();
             let mut buffer = [0; 1024];
             loop {
                 let len = channel.recv(&mut buffer).await?;
-                if len == 0 { bail!("AAP connection closed before proximity keys arrived"); }
+                if len == 0 {
+                    bail!("AAP connection closed before proximity keys arrived");
+                }
                 if let Some(Packet::Keys(keys)) = protocol::parse(&buffer[..len]) {
-                    if let Some(key) = keys.irk { received.irk = Some(key); }
-                    if let Some(key) = keys.enc { received.enc = Some(key); }
-                    if let (Some(irk), Some(enc)) = (received.irk, received.enc) { return Ok::<_, anyhow::Error>(Keys { irk, enc }); }
+                    if let Some(key) = keys.irk {
+                        received.irk = Some(key);
+                    }
+                    if let Some(key) = keys.enc {
+                        received.enc = Some(key);
+                    }
+                    if let (Some(irk), Some(enc)) = (received.irk, received.enc) {
+                        return Ok::<_, anyhow::Error>(Keys { irk, enc });
+                    }
                 }
             }
-        }).await.context("setup timed out waiting for valid proximity keys").and_then(|r| r);
+        })
+        .await
+        .context("setup timed out waiting for valid proximity keys")
+        .and_then(|r| r);
         // Always end the authorized setup exception, including malformed keys,
         // timeout, pairing errors, or a failed atomic write.
         let guard_result = self.guard().await;
@@ -137,26 +262,40 @@ impl Actor {
                 storage::save(&config)?;
                 self.config = Some(config);
             }
-            Err(e) => { guard_result?; return Err(e); }
+            Err(e) => {
+                guard_result?;
+                return Err(e.into());
+            }
         }
         guard_result?;
         self.reset_state();
         self.require_removal = false;
-        self.scan = Some(bluetooth::scanner(adapter, self.config.clone().unwrap(), self.tx.clone()).await?);
+        self.scan =
+            Some(bluetooth::scanner(adapter, self.config.clone().unwrap(), self.tx.clone()).await?);
         Ok(())
     }
     async fn release(&mut self) -> Result<()> {
-        if let Some(task) = self.scan.take() { task.abort(); }
+        if let Some(task) = self.scan.take() {
+            task.abort();
+        }
         self.guard().await?;
-        let Some(mut config) = self.config.clone().filter(|c| c.managed) else { return Ok(()); };
-        let adapter = self.adapter.as_ref().context("Bluetooth is unavailable; cannot restore original device setting")?;
+        let Some(mut config) = self.config.clone().filter(|c| c.managed) else {
+            return Ok(());
+        };
+        let adapter = self
+            .adapter
+            .as_ref()
+            .context("Bluetooth is unavailable; cannot restore original device setting")?;
         let device = adapter.device(config.address.parse()?)?;
         // Restore first, then relinquish ownership. A crash between these two
         // steps remains safely recoverable: guard can re-block, release retries.
         device.set_blocked(config.original_blocked).await?;
         config.managed = false;
         if let Err(e) = storage::save(&config) {
-            device.set_blocked(true).await.context("release save failed and guard could not be restored")?;
+            device
+                .set_blocked(true)
+                .await
+                .context("release save failed and guard could not be restored")?;
             return Err(e);
         }
         self.config = Some(config);
@@ -165,65 +304,122 @@ impl Actor {
         self.snapshot.error = None;
         Ok(())
     }
-    async fn command(&mut self, command: Command) -> Result<()> {
+    async fn command(&mut self, command: Command) -> Result<(), CommandError> {
         match command {
             Command::Setup(address) => self.setup(address).await,
-            Command::Release => self.release().await,
-            Command::Mode(mode) => {
-                if !self.snapshot.connected || !self.live_ears || !wearing(self.snapshot.in_ear) { bail!("noise control requires a live in-ear connection"); }
-                let channel = self.socket.as_ref().context("AAP control channel is unavailable")?;
-                bluetooth::send(channel, &protocol::mode_packet(mode)).await?;
-                self.pending_mode = (self.snapshot.mode != Some(mode)).then(|| (mode, Instant::now() + Duration::from_secs(5)));
-                self.snapshot.error = None;
-                // Do not optimistically claim the mode; the device notification
-                // is the source of truth, including unsupported mode requests.
-                Ok(())
-            }
+            Command::Release => Ok(self.release().await?),
+            Command::Mode(mode) => self.set_mode(mode).await.map_err(CommandError::rejected),
         }
+    }
+    async fn set_mode(&mut self, mode: Mode) -> Result<()> {
+        if !self.snapshot.connected || !self.live_ears || !wearing(self.snapshot.in_ear) {
+            bail!("noise control requires a live in-ear connection");
+        }
+        let channel = self
+            .socket
+            .as_ref()
+            .context("AAP control channel is unavailable")?;
+        bluetooth::send(channel, &protocol::mode_packet(mode)).await?;
+        self.pending_mode = (self.snapshot.mode != Some(mode))
+            .then(|| (mode, Instant::now() + Duration::from_secs(5)));
+        self.snapshot.error = None;
+        // Do not optimistically claim the mode; the device notification
+        // is the source of truth, including unsupported mode requests.
+        Ok(())
     }
     async fn event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Advertisement { data, at, fresh } => {
-                if at <= self.cutoff || at.elapsed() > FRESH { return Ok(()); }
-                let Some(keys) = self.config.as_ref().filter(|c| c.configured()).and_then(|c| c.keys.as_ref()) else { return Ok(()); };
+                if at <= self.cutoff || at.elapsed() > FRESH {
+                    return Ok(());
+                }
+                let Some(keys) = self
+                    .config
+                    .as_ref()
+                    .filter(|c| c.configured())
+                    .and_then(|c| c.keys.as_ref())
+                else {
+                    return Ok(());
+                };
                 let Some(ad) = protocol::advertisement(&data, &keys.enc) else {
-                    if fresh && !self.live_ears && (self.connection.is_some() || self.socket.is_some()) {
+                    if fresh
+                        && !self.live_ears
+                        && (self.connection.is_some() || self.socket.is_some())
+                    {
                         self.guard().await?;
                     }
                     return Ok(());
                 };
                 // A live notification-based AAP state is not expired by absent
                 // or stale BLE reports, nor overwritten by older broadcasts.
-                if self.live_ears { return Ok(()); }
+                if self.live_ears {
+                    return Ok(());
+                }
                 self.snapshot.in_ear = ad.ears;
                 self.snapshot.battery = ad.battery;
-                if !fresh { return Ok(()); }
+                if !fresh {
+                    return Ok(());
+                }
                 self.last_ble = Some(at);
                 if !wearing(ad.ears) {
-                    if ad.ears == [Some(false); 2] { self.require_removal = false; }
+                    if ad.ears == [Some(false); 2] {
+                        self.require_removal = false;
+                    }
                     let ears = ad.ears;
-                    if self.connection.is_some() || self.socket.is_some() { self.guard().await?; }
+                    if self.connection.is_some() || self.socket.is_some() {
+                        self.guard().await?;
+                    }
                     self.snapshot.in_ear = ears;
-                } else if !self.require_removal && self.connection.is_none() && self.socket.is_none() {
-                    let adapter = self.adapter.clone().context("Bluetooth adapter is unavailable")?;
+                } else if !self.require_removal
+                    && self.connection.is_none()
+                    && self.socket.is_none()
+                {
+                    let adapter = self
+                        .adapter
+                        .clone()
+                        .context("Bluetooth adapter is unavailable")?;
                     let config = self.config.clone().context("device is not configured")?;
                     // No fallback connects on lid, model, name, RSSI, or merely
                     // advertised disconnected state. Each attempt consumes a
                     // newly received, identity-resolved positive observation.
-                    if at.elapsed() > FRESH { return Ok(()); }
+                    if at.elapsed() > FRESH {
+                        return Ok(());
+                    }
                     // One attempt per wearing transition. A failed AAP check
                     // must not cause an endless connect/disconnect loop.
                     self.require_removal = true;
-                    adapter.device(config.address.parse()?)?.set_blocked(false).await?;
+                    adapter
+                        .device(config.address.parse()?)?
+                        .set_blocked(false)
+                        .await?;
                     self.snapshot.status = "connecting".into();
                     self.snapshot.error = None;
-                    self.connection = Some(bluetooth::connect(adapter, config, self.generation, self.tx.clone()));
+                    self.connection = Some(bluetooth::connect(
+                        adapter,
+                        config,
+                        self.generation,
+                        self.tx.clone(),
+                    ));
                 }
             }
             Event::Ready { generation, result } => {
-                if generation != self.generation { return Ok(()); }
+                if generation != self.generation {
+                    return Ok(());
+                }
                 self.connection = None;
-                let socket = result?;
+                let socket = match result {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        // A failed attempt ends this wearing transition only:
+                        // guard the device, keep the BlueZ session and scanner,
+                        // and leave require_removal set so it is not retried.
+                        self.guard().await?;
+                        self.error(format!(
+                            "Connection attempt failed: {e:#}; remove both buds before retrying"
+                        ));
+                        return Ok(());
+                    }
+                };
                 if !wearing(self.snapshot.in_ear) {
                     drop(socket);
                     self.guard().await?;
@@ -233,10 +429,21 @@ impl Actor {
                 self.ear_deadline = Some(Instant::now() + Duration::from_secs(5));
                 // Wait for actual AAP ear confirmation before exposing controls.
             }
-            Event::Connected(false) if self.socket.is_some() || self.connection.is_some() => { self.guard().await?; }
-            Event::Connected(true) | Event::Blocked(false) if self.socket.is_none() && self.connection.is_none() => { self.guard().await?; }
-            Event::Failure(message) => { self.offline(message).await; }
-            Event::AudioWarning { generation, message } if generation == self.generation && self.live_ears => {
+            Event::Connected(false) if self.socket.is_some() || self.connection.is_some() => {
+                self.guard().await?;
+            }
+            Event::Connected(true) | Event::Blocked(false)
+                if self.socket.is_none() && self.connection.is_none() =>
+            {
+                self.guard().await?;
+            }
+            Event::Failure(message) => {
+                self.offline(message).await;
+            }
+            Event::AudioWarning {
+                generation,
+                message,
+            } if generation == self.generation && self.live_ears => {
                 self.snapshot.error = Some(message);
             }
             Event::MediaWarning(message) => self.snapshot.error = Some(message),
@@ -257,7 +464,9 @@ impl Actor {
                 self.aap_ears = ears;
                 let sided = self.sided_ears();
                 if !wearing(ears) {
-                    if ears == [Some(false); 2] { self.require_removal = false; }
+                    if ears == [Some(false); 2] {
+                        self.require_removal = false;
+                    }
                     self.guard().await?;
                     self.snapshot.in_ear = sided;
                 } else {
@@ -275,21 +484,36 @@ impl Actor {
                             let generation = self.generation;
                             self.audio = Some(tokio::spawn(async move {
                                 if let Err(e) = bluetooth::prefer_aac(&address).await {
-                                    let _ = tx.send(Event::AudioWarning { generation, message: format!("Connected; AAC preference unavailable: {e:#}") }).await;
+                                    let _ = tx
+                                        .send(Event::AudioWarning {
+                                            generation,
+                                            message: format!(
+                                                "Connected; AAC preference unavailable: {e:#}"
+                                            ),
+                                        })
+                                        .await;
                                 }
                             }));
                         }
                     }
                 }
             }
-            Some(Packet::Batteries { battery, primary_left }) => {
+            Some(Packet::Batteries {
+                battery,
+                primary_left,
+            }) => {
                 self.snapshot.battery = battery;
                 self.primary_left = primary_left;
-                if self.live_ears { self.snapshot.in_ear = self.sided_ears(); }
+                if self.live_ears {
+                    self.snapshot.in_ear = self.sided_ears();
+                }
             }
             Some(Packet::Mode(mode)) => {
                 self.snapshot.mode = mode;
-                if self.pending_mode.is_some_and(|(requested, _)| mode == Some(requested)) {
+                if self
+                    .pending_mode
+                    .is_some_and(|(requested, _)| mode == Some(requested))
+                {
                     self.pending_mode = None;
                 }
             }
@@ -299,22 +523,47 @@ impl Actor {
     }
 }
 
-pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender<Snapshot>, mut shutdown: oneshot::Receiver<()>) -> Result<()> {
+pub async fn run(
+    mut requests: mpsc::Receiver<Request>,
+    snapshots: watch::Sender<Snapshot>,
+    mut shutdown: oneshot::Receiver<()>,
+    plugin_dir: Option<PathBuf>,
+) -> Result<()> {
     let config = storage::load()?;
     let (tx, mut events) = mpsc::channel(64);
     let media = tokio::spawn(crate::media::run(snapshots.subscribe(), tx.clone()));
     let mut actor = Actor {
-        config, session: None, adapter: None, scan: None, connection: None, socket: None,
-        generation: 0, cutoff: Instant::now(), last_ble: None, ear_deadline: None, live_ears: false, require_removal: false,
-        primary_left: None, aap_ears: [None; 2], pending_mode: None, audio: None,
-        snapshot: Snapshot::default(), snapshots, tx,
+        config,
+        session: None,
+        adapter: None,
+        scan: None,
+        connection: None,
+        socket: None,
+        generation: 0,
+        cutoff: Instant::now(),
+        last_ble: None,
+        ear_deadline: None,
+        live_ears: false,
+        require_removal: false,
+        primary_left: None,
+        aap_ears: [None; 2],
+        pending_mode: None,
+        audio: None,
+        snapshot: Snapshot::default(),
+        snapshots,
+        tx,
     };
-    if let Some(config) = &actor.config { actor.snapshot.name = config.name.clone(); }
+    if let Some(config) = &actor.config {
+        actor.snapshot.name = config.name.clone();
+    }
     actor.reset_state();
-    if let Err(e) = actor.initialize().await { actor.offline(format!("{e:#}")).await; }
+    if let Err(e) = actor.initialize().await {
+        actor.offline(format!("{e:#}")).await;
+    }
     actor.publish();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut maintenance = Instant::now();
+    let mut plugin_missing_checks = 0;
     let mut buffer = [0; 1024];
     loop {
         let socket = actor.socket.clone();
@@ -322,14 +571,14 @@ pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender
             _ = &mut shutdown => break,
             request = requests.recv() => {
                 let Some(request) = request else { break; };
-                let changes_ownership = !matches!(&request.command, Command::Mode(_));
                 let result = actor.command(request.command).await;
                 if let Err(e) = &result {
-                    if changes_ownership { actor.offline(format!("{e:#}")).await; }
-                    else { actor.snapshot.error = Some(format!("{e:#}")); }
+                    let message = format!("{:#}", e.error);
+                    if e.offline { actor.offline(message).await; }
+                    else { actor.snapshot.error = Some(message); }
                 }
                 actor.publish();
-                let _ = request.reply.send(result.map(|_| actor.snapshot.clone()));
+                let _ = request.reply.send(result.map(|_| actor.snapshot.clone()).map_err(|e| e.error));
             }
             Some(event) = events.recv() => {
                 if let Err(e) = actor.event(event).await {
@@ -380,28 +629,53 @@ pub async fn run(mut requests: mpsc::Receiver<Request>, snapshots: watch::Sender
                             Err(e) => actor.offline(format!("{e:#}")).await,
                         }
                     }
+                    // `omarchy plugin remove` runs no hooks. Without its plugin
+                    // the daemon has no UI, so restore the device and stop.
+                    if let Some(dir) = &plugin_dir {
+                        plugin_missing_checks = if dir.is_dir() { 0 } else { plugin_missing_checks + 1 };
+                        if plugin_missing_checks >= PLUGIN_GONE_CHECKS {
+                            match actor.release().await {
+                                Ok(()) => {
+                                    eprintln!("airpodsd: plugin folder {} is gone; device released, stopping", dir.display());
+                                    break;
+                                }
+                                Err(e) => actor.offline(format!("Plugin folder is gone, but release failed: {e:#}")).await,
+                            }
+                        }
+                    }
                 }
                 actor.publish();
             }
         }
     }
     media.abort();
-    if let Some(task) = actor.scan.take() { task.abort(); }
+    if let Some(task) = actor.scan.take() {
+        task.abort();
+    }
     actor.guard().await
 }
 
 pub async fn offline_guard(release: bool) -> Result<()> {
-    let Some(mut config) = storage::load()?.filter(|c| c.managed) else { return Ok(()); };
-    let session = Session::new().await.context("BlueZ is unavailable; device guard cannot be changed")?;
+    let Some(mut config) = storage::load()?.filter(|c| c.managed) else {
+        return Ok(());
+    };
+    let session = Session::new()
+        .await
+        .context("BlueZ is unavailable; device guard cannot be changed")?;
     let adapter = bluetooth::adapter(&session, Some(&config)).await?;
     if release {
         let device = adapter.device(config.address.parse()?)?;
         device.set_blocked(config.original_blocked).await?;
         config.managed = false;
         if let Err(e) = storage::save(&config) {
-            device.set_blocked(true).await.context("release save failed and guard could not be restored")?;
+            device
+                .set_blocked(true)
+                .await
+                .context("release save failed and guard could not be restored")?;
             return Err(e);
         }
-    } else { bluetooth::block(&adapter, &config).await?; }
+    } else {
+        bluetooth::block(&adapter, &config).await?;
+    }
     Ok(())
 }

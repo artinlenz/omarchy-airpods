@@ -17,7 +17,7 @@ function unavailable(configured, name) {
   return snapshot({
     schema: 1, configured: configured === true, name: name || "AirPods",
     status: "error", connected: false, in_ear: [null, null],
-    battery: {}, mode: null, error: null, paired_devices: []
+    battery: {}, mode: null, error: null, paired_devices: [], version: ""
   })
 }
 
@@ -47,7 +47,9 @@ function snapshot(value) {
     }),
     mode: ["off", "anc", "transparency", "adaptive"].indexOf(value.mode) >= 0 ? value.mode : null,
     error: typeof value.error === "string" ? value.error : null,
-    paired_devices: Object.freeze(devices)
+    paired_devices: Object.freeze(devices),
+    // Backends before 0.1.0 report no version; "" never matches a manifest.
+    version: typeof value.version === "string" ? value.version : ""
   })
 }
 

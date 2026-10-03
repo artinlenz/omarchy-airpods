@@ -7,6 +7,9 @@ After=graphical-session.target
 
 [Service]
 Type=simple
+# Without this folder the plugin is gone: the daemon releases the device and
+# exits. install.sh --backend-only clears it in a standalone.conf drop-in.
+Environment=AIRPODSD_PLUGIN_DIR=%h/.config/omarchy/plugins/artinlenz.airpods
 ExecStart=%h/.local/bin/airpodsd daemon
 ExecStopPost=%h/.local/bin/airpodsd guard
 Restart=on-failure
