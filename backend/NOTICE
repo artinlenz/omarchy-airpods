@@ -1,8 +1,9 @@
 omarchy-airpods backend (airpodsd)
-SPDX-License-Identifier: AGPL-3.0-only
+SPDX-License-Identifier: GPL-3.0-or-later
 
 This backend contains protocol and cryptographic routines adapted from
-LibrePods, copyright Kavish Devar and LibrePods contributors.
+LibrePods, copyright Kavish Devar and LibrePods contributors, licensed under
+the GNU General Public License version 3 or (at your option) any later version.
 Upstream: https://github.com/kavishdevar/librepods
 Sources: linux-rust/src/bluetooth/aacp.rs, linux-rust/src/bluetooth/le.rs,
 linux-rust/src/utils.rs; corroborating proximity layout from
@@ -16,9 +17,13 @@ and BlueZ blocking when not authorized; MPRIS pause/resume on single-bud
 removal/reinsertion with per-player resume ownership; no GUI, tray,
 raw-packet/key logging, feature flags or unrelated firmware writes.
 
-This backend and its modifications are distributed under the GNU Affero
-General Public License version 3 only. See LICENSE in this directory.
-The independently authored frontend and integration files have their own
-license at the project root. No Apple images, symbols, fonts or assets are
-included here. AirPods is a trademark of Apple Inc.; this project is not
+This backend and its modifications are free software: you can redistribute
+them and/or modify them under the terms of the GNU General Public License as
+published by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version. See LICENSE in this directory.
+This project is not affiliated with or endorsed by the LibrePods project.
+
+The independently authored Omarchy plugin and integration files have their
+own MIT license at the project root. No Apple images, symbols, fonts or assets
+are included here. AirPods is a trademark of Apple Inc.; this project is not
 endorsed by or affiliated with Apple Inc.

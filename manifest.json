@@ -1,9 +1,10 @@
 {
   "schemaVersion": 1,
   "id": "artinlenz.airpods",
-  "name": "AirPods",
-  "version": "1.0.0",
+  "name": "AirPods In-Ear Guard",
+  "version": "0.1.0",
   "author": "artinlenz",
+  "license": "MIT (plugin), GPL-3.0-or-later (airpodsd daemon)",
   "description": "In-ear-only AirPods connection status, batteries and listening modes",
   "kinds": ["service", "bar-widget"],
   "entryPoints": {
@@ -11,7 +12,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "AirPods",
+    "displayName": "AirPods In-Ear Guard",
     "description": "Compact AirPods status and controls",
     "category": "Media",
     "allowMultiple": false,

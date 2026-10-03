@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 use crate::{model::PairedDevice, protocol, storage::Config};
 use anyhow::{anyhow, bail, Context, Result};
 use bluer::{
