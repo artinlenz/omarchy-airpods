@@ -17,6 +17,8 @@ fi
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 cache_home=${XDG_CACHE_HOME:-$HOME/.cache}
+unit_dir="$config_home/systemd/user"
+standalone_dropin="$unit_dir/omarchy-airpods.service.d/standalone.conf"
 
 if [[ $backend_only == false && $root != "$HOME/.config/omarchy/plugins/artinlenz.airpods" ]]; then
   echo 'First install this repository with omarchy plugin add, then run install.sh from its installed directory.' >&2
@@ -26,12 +28,22 @@ fi
 
 cargo build --release --locked --manifest-path "$root/backend/Cargo.toml" --target-dir "$cache_home/omarchy-airpods/target"
 install -Dm755 "$cache_home/omarchy-airpods/target/release/airpodsd" "$HOME/.local/bin/airpodsd"
-install -Dm644 "$root/packaging/omarchy-airpods.service" "$config_home/systemd/user/omarchy-airpods.service"
+install -Dm644 "$root/packaging/omarchy-airpods.service" "$unit_dir/omarchy-airpods.service"
+if [[ $backend_only == true ]]; then
+  # A development checkout has no plugin folder, so the daemon must not
+  # release the device and stop when it finds none.
+  mkdir -p "$(dirname -- "$standalone_dropin")"
+  printf '[Service]\nEnvironment=AIRPODSD_PLUGIN_DIR=\n' >"$standalone_dropin"
+else
+  rm -f "$standalone_dropin"
+fi
 systemctl --user daemon-reload
 systemctl --user enable omarchy-airpods.service
 systemctl --user restart omarchy-airpods.service
 
 if [[ $backend_only == false ]]; then
-  omarchy plugin enable artinlenz.airpods --section right
+  # Places the widget only if it is not on the bar yet; never moves it.
+  omarchy bar put artinlenz.airpods ||
+    echo 'Add the widget later with: omarchy bar put artinlenz.airpods' >&2
 fi
 printf 'AirPods service installed. Use the panel to select your paired AirPods and run one-time setup.\n'
