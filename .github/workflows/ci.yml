@@ -60,3 +60,5 @@ jobs:
             echo "manifest.json version $manifest differs from backend/Cargo.toml version $cargo" >&2
             exit 1
           fi
+      - name: Exercise guard-safe removal
+        run: bash plugin/tests/uninstall.sh

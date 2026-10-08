@@ -77,21 +77,33 @@ omarchy plugin remove artinlenz.airpods
 
 ### If you removed the plugin first
 
-`omarchy plugin remove` runs no hooks. Within about ten seconds, the daemon notices that the plugin folder is gone, releases the AirPods and stops. If it cannot release them, it keeps retrying. To release them by hand and clean up:
+`omarchy plugin remove` runs no hooks. Within about ten seconds, the daemon notices that the plugin folder is gone, releases the AirPods and stops. If it cannot release them, it keeps retrying. To release them immediately:
 
 ```bash
 airpodsd release
-systemctl --user disable --now omarchy-airpods.service
-rm -f ~/.local/bin/airpodsd ~/.config/systemd/user/omarchy-airpods.service
-rm -rf ~/.config/systemd/user/omarchy-airpods.service.d
-systemctl --user daemon-reload
 ```
 
-If `airpodsd` is already gone, unblock the AirPods with their address, which is shown in the panel and stored in `~/.config/omarchy-airpods/config.json`:
+For complete cleanup, restore the plugin checkout and use its uninstaller rather than deleting service files or private state by hand.
+
+### If the daemon binary is missing
+
+The uninstaller refuses teardown when the stored configuration still owns a device guard, is unreadable or has an unknown ownership state. It keeps the service, plugin and private setup data so recovery remains possible. A missing binary permits cleanup only when configuration is absent or explicitly records `managed: false`.
+
+Restore the plugin checkout first if it is missing:
 
 ```bash
-bluetoothctl unblock AA:BB:CC:DD:EE:FF
+omarchy plugin add https://github.com/artinlenz/omarchy-airpods.git --yes
 ```
+
+Then rebuild the daemon and rerun normal removal:
+
+```bash
+~/.config/omarchy/plugins/artinlenz.airpods/install.sh &&
+  ~/.config/omarchy/plugins/artinlenz.airpods/uninstall.sh &&
+  omarchy plugin remove artinlenz.airpods
+```
+
+Do not delete private configuration to bypass the guard check or manually unblock a device while the service may still manage it. Restoring the daemon and releasing it preserves the original blocking setting and relinquishes ownership.
 
 ### Releasing without uninstalling
 
@@ -125,6 +137,14 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
+
+Run the isolated removal regression scenarios from the repository root as a non-root user:
+
+```bash
+bash tests/uninstall.sh
+```
+
+These exercise the actual uninstaller with disposable home/configuration directories and stubbed systemd/plugin commands; no Bluetooth device is changed.
 
 ## License
 
